@@ -1,0 +1,12 @@
+{
+  "name": "box-girder-studio",
+  "version": "1.8.0",
+  "private": true,
+  "description": "Aplikasi offline untuk pemodelan dan analisis penampang box girder.",
+  "scripts": {
+    "test": "node --test tests/smoke.cjs"
+  },
+  "devDependencies": {
+    "playwright": "1.62.1"
+  }
+}

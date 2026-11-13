@@ -4,7 +4,7 @@
   "private": true,
   "description": "Aplikasi offline untuk pemodelan dan analisis penampang box girder.",
   "scripts": {
-    "test": "node --test tests/smoke.cjs"
+    "test": "node --test --test-concurrency=1 tests/smoke.cjs tests/shear-suggestions.cjs"
   },
   "devDependencies": {
     "playwright": "1.62.1"

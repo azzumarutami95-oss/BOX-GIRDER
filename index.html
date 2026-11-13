@@ -1,7 +1,8 @@
 <!DOCTYPE html>
 <!-- Regenerated as Box Girder Studio on 2026-11-13 from the user-supplied HTML.
      Updated application branding; retained calculation engines, model data,
-     storage compatibility, bundled dependencies, and original license notices. -->
+     storage compatibility, bundled dependencies, and original license notices.
+     Added model-based shear proposals with explicit assumptions and manual overrides. -->
 <html lang="id">
 <head>
   <meta charset="utf-8">
@@ -2118,6 +2119,139 @@ if(typeof module==='object'&&module.exports)module.exports=root.DwgLayers;
 
 </script>
 <script>
+/* Geometric proposals and prestress inventory, not a design-code verification.
+ * Input coordinates are metres; candidate widths are mm; steel areas are mm²;
+ * Pe is axial effective prestress in kN, never a transverse Vp component.
+ * Dependencies are resolved when evaluate() runs, after the bundled engine loads.
+ */
+(function (root) {
+  'use strict';
+  const finite = Number.isFinite;
+  const point = p => Array.isArray(p) && p.length === 2 && p.every(finite);
+  const clean = ring => {
+    const result = ring.map(p => p.slice());
+    if (result.length > 1 && result[0].every((v, i) => v === result[result.length - 1][i])) result.pop();
+    return result;
+  };
+  const source = axis => 'Usulan geometri bruto · ' + (axis === 'Y' ? 'jumlah lebar web pada irisan horizontal' : 'jumlah tebal slab pada irisan vertikal');
+  const formula = 'bv,bruto = min [panjang irisan luar − panjang irisan rongga] × 1.000';
+  const note = 'Lebar beton bruto dari kontur satu sel, sebelum pengurangan duct. Pemilihan daerah geser efektif, pengaruh duct, web miring, dan pemetaan sumbu harus ditinjau untuk proyek; bukan bv efektif yang telah diverifikasi.';
+  function pending(axis, reason) {
+    return {value: null, source: source(axis), formula, note, assumed: true,
+      status: 'pending', reason, units: 'mm', basis: 'minimum-gross-concrete-chord', codeVerified: false};
+  }
+
+  // Between consecutive projected vertices, each intersected edge is fixed and
+  // each intersection coordinate is affine. Its endpoint limits give the exact
+  // piecewise-linear minimum, without sampling over a fixed grid or extrapolating
+  // across a vertex. Restrict to a single outer interval containing one void.
+  function width(outer, inner, axis, origin) {
+    const dimension = axis === 'Y' ? 1 : 0, transverse = 1 - dimension;
+    const low = Math.min(...inner.map(p => p[dimension]));
+    const high = Math.max(...inner.map(p => p[dimension]));
+    const events = [...new Set([low, high, ...outer.concat(inner).map(p => p[dimension])
+      .filter(value => value > low && value < high)])].sort((a, b) => a - b);
+    if (!finite(high - low) || high <= low) return pending(axis, 'Rentang rongga pada arah ini belum valid.');
+    let best = null;
+    function intersections(ring, at) {
+      const edges = [];
+      for (let i = 0; i < ring.length; i++) {
+        const a = ring[i], b = ring[(i + 1) % ring.length];
+        if ((a[dimension] < at && at < b[dimension]) || (b[dimension] < at && at < a[dimension])) {
+          const atCoordinate = value => a[transverse] + (value - a[dimension]) *
+            (b[transverse] - a[transverse]) / (b[dimension] - a[dimension]);
+          edges.push({at: atCoordinate, midpoint: atCoordinate(at)});
+        }
+      }
+      return edges.sort((a, b) => a.midpoint - b.midpoint);
+    }
+    for (let i = 0; i + 1 < events.length; i++) {
+      const lo = events[i], hi = events[i + 1], mid = lo + (hi - lo) / 2;
+      if (!(lo < mid && mid < hi)) return pending(axis, 'Selisih koordinat terlalu kecil untuk menentukan irisan yang andal.');
+      const out = intersections(outer, mid), hole = intersections(inner, mid);
+      if (out.length !== 2 || hole.length !== 2) return pending(axis, 'Usulan memerlukan satu interval luar dan satu interval rongga pada setiap irisan; gunakan lebar manual untuk geometri ini.');
+      for (const at of [lo, hi]) {
+        const leftWeb = hole[0].at(at) - out[0].at(at);
+        const rightWeb = out[1].at(at) - hole[1].at(at);
+        const gross = leftWeb + rightWeb;
+        if (![leftWeb, rightWeb, gross].every(finite) || leftWeb <= 0 || rightWeb <= 0 || gross <= 0) {
+          return pending(axis, 'Irisan beton tidak memiliki dua dinding dengan lebar positif yang mengapit rongga.');
+        }
+        if (!best || gross < best.gross) best = {gross, at, interval: [lo, hi], walls: [leftWeb, rightWeb]};
+      }
+    }
+    if (!best || !finite(best.gross * 1000)) return pending(axis, 'Lebar usulan belum dapat dihitung.');
+    return {...pending(axis, null), value: best.gross * 1000, status: 'proposed',
+      station: best.at + origin[dimension], stationUnits: 'm',
+      interval: best.interval.map(v => v + origin[dimension]),
+      wallWidths: best.walls.map(v => v * 1000),
+      depthAxis: axis === 'Y' ? 'worldY' : 'worldX', intervalCount: events.length - 1};
+  }
+
+  function geometricWidths(model) {
+    const fail = reason => ({Y: pending('Y', reason), Z: pending('Z', reason)});
+    if (model?.design?.coordinateUnits !== 'm') return fail('Usulan memerlukan satuan koordinat meter yang ditetapkan pada model.');
+    if (typeof root.SectionEngine?.geometryMetrics !== 'function') return fail('Modul validasi geometri penampang belum tersedia.');
+    const geometry = model.geometry;
+    for (const name of ['outer', 'inner']) {
+      const ring = geometry?.[name];
+      if (!Array.isArray(ring) || ring.length < 3 || ring.length > 501 || !ring.every(point)) {
+        return fail('Usulan memerlukan kontur luar dan satu rongga valid, masing-masing 3–500 titik dalam meter.');
+      }
+    }
+    try { root.SectionEngine.geometryMetrics(geometry); }
+    catch (error) { return fail(error.message || 'Geometri penampang belum valid.'); }
+    // Work near a common local origin to avoid cancellation in remote CAD coordinates.
+    const origin = geometry.outer[0];
+    const local = ring => clean(ring).map(p => p.map((v, i) => v - origin[i]));
+    const outer = local(geometry.outer), inner = local(geometry.inner);
+    return {Y: width(outer, inner, 'Y', origin), Z: width(outer, inner, 'Z', origin)};
+  }
+
+  function inventory(model) {
+    const errors = [];
+    const tendons = Array.isArray(model?.tendons) ? model.tendons : null;
+    const cases = Array.isArray(model?.cases) ? model.cases : [];
+    const rows = cases.map(c => ({id: typeof c?.id === 'string' ? c.id : '',
+      name: typeof c?.name === 'string' ? c.name : '', strands: null, area: null, Pe: null}));
+    const output = {tendonCount: tendons ? tendons.length : null, cases: rows, errors,
+      formula: 'Aps = Σ jumlah strand per tendon × luas satu strand; Pe = Aps × fpu × UTS × (1 − losses) / 1.000',
+      source: 'Jumlah tendon dan jadwal strand setiap kasus pada model aktif',
+      note: 'Pe adalah resultan aksial efektif, bukan Vp,y atau Vp,z. Koordinat penampang dan jumlah tendon tidak menentukan kemiringan longitudinal tendon.',
+      units: {area: 'mm²', Pe: 'kN'}};
+    if (typeof root.TendonSchedule?.validate !== 'function' || typeof root.TendonSchedule?.resolve !== 'function') {
+      errors.push('Modul jadwal strand belum tersedia.'); return output;
+    }
+    errors.push(...root.TendonSchedule.validate(model));
+    const p = model?.prestress, fpu = model?.material?.fpu;
+    if (!finite(p?.strandArea) || p.strandArea <= 0) errors.push('Luas satu strand harus positif dan valid.');
+    if (!finite(fpu) || fpu <= 0) errors.push('fpu harus positif dan valid.');
+    if (!finite(p?.uts) || p.uts <= 0 || p.uts > 1) errors.push('Rasio UTS harus lebih dari 0 dan paling besar 1.');
+    if (!finite(p?.loss) || p.loss < 0 || p.loss >= 1) errors.push('Losses harus berada pada rentang 0 sampai kurang dari 1.');
+    if (errors.length) return output;
+    const totals = cases.map(c => {
+      let strands = 0;
+      for (const tendon of tendons) {
+        const count = root.TendonSchedule.resolve(c, tendon);
+        if (!Number.isSafeInteger(count) || count <= 0) {
+          errors.push(`${c.name || c.id}: jumlah strand ${tendon.id} belum valid.`);
+        } else strands += count;
+      }
+      const area = strands * p.strandArea, Pe = area * fpu * p.uts * (1 - p.loss) / 1000;
+      if (!Number.isSafeInteger(strands) || !finite(area) || !finite(Pe)) errors.push(`${c.name || c.id}: jumlah atau gaya prategang melampaui rentang perhitungan.`);
+      return {strands, area, Pe};
+    });
+    // Never display partial sums as a complete inventory when any schedule is invalid.
+    if (!errors.length) rows.forEach((row, i) => Object.assign(row, totals[i]));
+    return output;
+  }
+
+  const api = Object.freeze({evaluate: model => ({widths: geometricWidths(model), inventory: inventory(model)})});
+  root.ShearSuggestions = api;
+  if (typeof module === 'object' && module.exports) module.exports = api;
+})(typeof globalThis !== 'undefined' ? globalThis : this);
+
+
 /* Automatic candidates, with explicit separation of section results and assumptions.
  * Coordinates: m; forceN: N; Mn: kN·m; derived depths: mm.
  * This module does not certify AASHTO applicability or a total V–T resistance. */
@@ -2204,17 +2338,28 @@ if(typeof module==='object'&&module.exports)module.exports=root.DwgLayers;
   const governing=values.reduce((a,b)=>a.value<=b.value?a:b);
   return {value:governing.value,source,formula:'T = Σ gaya baja tarik; z = Mn × 10⁶/T; de = Σ(Ti di)/ΣTi; dv = max(z, 0,9 de, 0,72 h)',assumed:false,status:'calculated',basis:'minimum-of-opposite-flexural-cases',governingCaseId:governing.id,cases:values,units:'mm',axisKey:axis,depthAxis:axis==='momentY'?'worldY':'worldX',note:'Minimum dv dari dua sisi tekan pada sumbu ini. Hasil penampang lentur murni N = 0; bukan solusi N–My–Mz dari kombinasi. Pemetaan arah gaya Y/Z harus sesuai konvensi model.'};
  }
- function evaluate(model,sectionResult){
+ function evaluate(model,sectionResult,settings=model?.design?.shearTorsion||{}){
+  const suggestions=globalThis.ShearSuggestions.evaluate(model);
+  const thetaMode=settings.thetaMode||((finite(settings.theta)&&settings.theta!==null)?'manual':'auto');
+  const theta=thetaMode==='auto'?45:thetaMode==='manual'?settings.theta:null;
+  const fixedAngle=finite(theta)&&Math.abs(theta-45)<1e-9;
+  const beta=axis=>({value:fixedAngle?2:null,source:'Usulan awal · β'+axis+' untuk θ = 45°',formula:'β = 2; θ = 45°',assumed:true,status:fixedAngle?'assumed':'pending',units:'',note:'Nilai awal rangka batang sudut tetap; bukan hasil MCFT atau verifikasi metode PSC AASHTO. β perlu ditinjau dari regangan dan kombinasi beban.',reason:fixedAngle?'':'θ aktif bukan 45°; tentukan β dan θ yang konsisten melalui input manual.'});
+  const duct=axis=>({value:1,source:'Asumsi awal · tanpa reduksi duct arah '+axis,formula:'kduct = 1',assumed:true,status:'assumed',units:'',note:'Diameter fisik, material, dan kondisi grouting duct belum tersedia. Jumlah tendon dan radius simbol gambar tidak menetapkan faktor koreksi duct.'});
+  const prestress=axis=>({value:suggestions.inventory.errors.length?null:0,source:'Asumsi tendon lurus · komponen arah '+axis,formula:'Vp = Σ Pe,i sin(αi); usulan αi = 0° → Vp = 0',assumed:true,status:suggestions.inventory.errors.length?'pending':'assumed',units:'kN',note:'Sudut profil longitudinal tidak ada pada model penampang. Pe pada ringkasan adalah gaya aksial, bukan Vp. Untuk tendon miring, isi Vp bertanda secara manual.',reason:suggestions.inventory.errors.length?'Lengkapi data tendon dan prategang sebelum memakai usulan.':''});
   const assumptions={
    theta:{value:45,source:'Asumsi awal · rangka batang sudut tetap',formula:'θ = 45°',assumed:true,status:'assumed',basis:'fixed-angle-truss',units:'°',note:'Bukan θ hasil MCFT dan bukan verifikasi prosedur AASHTO untuk PSC. Geometri penampang saja tidak menentukan θ.'},
    phiShear:{value:.9,source:'Koefisien awal proyek · geser',formula:'φv = 0,90',assumed:true,status:'assumed',basis:'initial-project-coefficient',units:'',note:'Koefisien awal terpisah dari φ lentur. Penerapan pada metode, kondisi dan edisi proyek belum diverifikasi.'},
    aoFactor:{value:.85,source:'Pendekatan awal luas aliran geser',formula:'Ao = 0,85 Aoh',assumed:true,status:'assumed',basis:'simplified-effective-area',units:'',note:'Faktor pendekatan, bukan rasio yang diselesaikan dari geometri atau analisis aliran geser dinding box.'}
   };
-  const fields={...assumptions,dvY:depth(model,sectionResult,'momentY'),dvZ:depth(model,sectionResult,'momentZ')};
-  return {values:Object.fromEntries(Object.entries(fields).map(([key,d])=>[key,d.value])),fields,notes:[
+  const fields={...assumptions,dvY:depth(model,sectionResult,'momentY'),dvZ:depth(model,sectionResult,'momentZ'),
+   bvY:suggestions.widths.Y,bvZ:suggestions.widths.Z,betaY:beta('y'),betaZ:beta('z'),
+   lambda:{value:1,source:'Asumsi beton berat normal',formula:'λ = 1',assumed:true,status:'assumed',units:'',note:'Jenis beton tidak disimpulkan dari kuat tekan. Untuk beton ringan, masukkan λ sesuai material dan metode proyek.'},
+   kductY:duct('Y'),kductZ:duct('Z'),VpY:prestress('Y'),VpZ:prestress('Z')};
+  return {values:Object.fromEntries(Object.entries(fields).map(([key,d])=>[key,d.value])),fields,suggestions,notes:[
    'θ, φv dan Ao/Aoh bertanda asumsi awal; ketiganya tidak dianggap telah diverifikasi dari penampang atau pasal desain.',
    'dv berasal dari resultan penampang lentur murni yang konvergen, dengan nilai minimum dari kedua sisi tekan. Nilai 0,72h tidak dipakai sebagai pengganti hasil penampang yang belum tersedia.',
-   'Arah Y mengikuti My/kedalaman Y editor dan arah Z mengikuti Mz/kedalaman X editor. Cocokkan dengan sumbu lokal sumber gaya.'
+   'Arah Y mengikuti My/kedalaman Y editor dan arah Z mengikuti Mz/kedalaman X editor. Cocokkan dengan sumbu lokal sumber gaya.',
+   'bv memakai usulan lebar beton bruto sebelum koreksi duct; β, λ, kduct, dan Vp memiliki asumsi awal yang ditampilkan. Gaya prategang aksial dari jumlah strand bukan komponen geser Vp.'
   ],errors:[],codeVerified:false,fullCheckPass:null};
  }
  return Object.freeze({evaluate});
@@ -2482,7 +2627,7 @@ if(typeof module==='object'&&module.exports)module.exports=root.DwgLayers;
   for(const row of candidates)if(finite(row.governingDcr)&&(!governing||row.governingDcr>governing.governingDcr))governing=row;
   const notes=[
    'DCR ≤ 1 hanya menyatakan rasio berada dalam batas model yang ditampilkan; bukan verifikasi desain lengkap.',
-   mode==='total'?'Geser beton+baja memakai β, bv efektif, λ, Vp bertanda dan kduct yang diisi; tidak ada nilai yang diasumsikan dari geometri saja.':'Mode baja membandingkan gaya dengan kontribusi baja yang tersedia; Vc dan Vp tidak dimasukkan ke model rasio ini.',
+   mode==='total'?'Geser beton+baja memakai β, bv, λ, Vp bertanda dan kduct dari input manual atau usulan awal. Tinjau sumber serta asumsi setiap parameter pada menu Geser & torsi; nilai usulan belum merupakan verifikasi metode proyek.':'Mode baja membandingkan gaya dengan kontribusi baja yang tersedia; Vc dan Vp tidak dimasukkan ke model rasio ini.',
    'DCR V–T sengkang menjumlahkan pemakaian baja transversal untuk setiap arah geser dan torsi. Ini bukan persamaan interaksi tekan beton box AASHTO.',
    mode==='total'?'DCR geser memakai |Vu| / φv(Vbase + Vp,dir), dengan Vp diproyeksikan ke arah gaya setiap baris. Kebutuhan sengkang geser = max(|Vu|/φv − Vc − Vp,dir, 0); arah Y/Z diperiksa terpisah.':'Rasio V–T sengkang memakai |Vu| tanpa memasukkan beton/prategang; arah Y/Z diperiksa terpisah.',
    'Geser dua arah simultan, alokasi kaki sengkang serta penerapan profil prategang pada setiap kombinasi tetap perlu ditinjau.',
@@ -2504,7 +2649,7 @@ if(typeof module==='object'&&module.exports)module.exports=root.DwgLayers;
  if(typeof module==='object'&&module.exports)module.exports=api;root.ShearProject=api;
 })(typeof globalThis!=='undefined'?globalThis:this,function(geometry,reinforcement,loads,automatic,longitudinal,dcr,solve){
  'use strict';
- const automaticKeys=Object.freeze(['theta','dvY','dvZ','phiShear','aoFactor']);
+ const automaticKeys=Object.freeze(['theta','dvY','dvZ','phiShear','aoFactor','bvY','bvZ','betaY','betaZ','lambda','kductY','kductZ','VpY','VpZ']);
  const defaults=Object.freeze({coverClear:null,diameter:null,spacing:null,legsY:null,legsZ:null,fyv:null,theta:null,dvY:null,dvZ:null,phiShear:null,phiTorsion:null,closedHoop:true,aoFactor:null,Al:null,AlMode:'auto',AlBarIds:Object.freeze([]),AlSourceSignature:null,fyl:null,longitudinalDistributed:false,loadSource:'table',loadRowId:null,VuY:null,VuZ:null,Tu:null,dcrMode:'steel',bvY:null,bvZ:null,betaY:null,betaZ:null,lambda:null,VpY:null,VpZ:null,kductY:null,kductZ:null,...Object.fromEntries(automaticKeys.map(key=>[key+'Mode','auto']))});
  const settings=model=>{
   const stored=model?.design?.shearTorsion||{},has=key=>Object.prototype.hasOwnProperty.call(stored,key),p=Object.fromEntries(Object.entries(defaults).map(([key,value])=>[key,has(key)?stored[key]:value]));
@@ -2520,7 +2665,7 @@ if(typeof module==='object'&&module.exports)module.exports=root.DwgLayers;
   const p=settings(model),key=JSON.stringify([model.geometry,model.design?.coordinateUnits,p.coverClear,p.diameter]);
   if(!cachedGeometry||cachedGeometry.key!==key)cachedGeometry={key,value:geometry.evaluate(model,{cover:p.coverClear,diameter:p.diameter,mode:'offset'})};
   const g=JSON.parse(JSON.stringify(cachedGeometry.value));
-  const auto=automatic.evaluate(model,sectionResult===undefined?solve(model):sectionResult),resolved={...p},parameterSources={};
+  const auto=automatic.evaluate(model,sectionResult===undefined?solve(model):sectionResult,p),resolved={...p},parameterSources={};
   for(const key of automaticKeys){
    const mode=p[key+'Mode'];
    resolved[key]=mode==='auto'?auto.values[key]:mode==='manual'?p[key]:null;
@@ -21436,10 +21581,16 @@ function shearDcrLimits(mode){
  return (mode==='total'?'Geser total: DCRv = |Vu| / [φv (Vbase + Vp,arah)], dengan Vbase = min(Vc + kduct Vs; 0,25 f′c bv dv / 1000). Vp,arah mengikuti tanda Vu. Kebutuhan baja geser = max(|Vu|/φv − Vc − Vp,arah; 0). ':'Geser memakai kapasitas kontribusi tulangan φVs; kontribusi beton dan Vp tidak dipakai dalam rasio baja ini. ')+
   'Torsi memakai batas baja. V–T menunjukkan pemakaian bersama sengkang untuk Y dan Z secara terpisah, bukan pemeriksaan interaksi tekan beton V–T atau geser dua arah simultan. Distribusi/detail tulangan dan pembagian baja longitudinal dengan lentur/geser tetap perlu diperiksa.';
 }
+function shearProposalNote(description){
+ const labels={bvY:'bv,y',bvZ:'bv,z',betaY:'βy',betaZ:'βz',lambda:'λ',kductY:'kduct,y',kductZ:'kduct,z',VpY:'Vp,y',VpZ:'Vp,z'};
+ const names=Object.entries(labels).filter(([key])=>description.settings[key+'Mode']==='auto').map(([,label])=>label);
+ if(description.dcr.mode!=='total'||!names.length)return '';
+ return `<p class="notice" data-shear-proposal-note><b>Hasil dengan usulan awal</b><br>Parameter: ${esc(names.join(', '))}. Tinjau sumber dan asumsi pada menu Geser &amp; torsi; rasio ini mengikuti asumsi tersebut.</p>`;
+}
 function shearDcrSummaryMarkup(description){
  const d=description.dcr||{},g=d.governing,s=d.selected,labels=shearDcrCheckLabels(d.mode),r=s&&Object.values(s.checks||{}).some(check=>Number.isFinite(check.dcr))?s:g;
  const source=r?.sourceLabel||'Belum ada kombinasi yang dapat dihitung';
- return `<div class="shear-dcr-summary" data-dcr-summary data-dcr-status="${shearDcrTone(g?.status)}"><div class="result-card hero-result"><div class="eyebrow">DCR TERBESAR TERHITUNG · MODEL</div><div class="hero-number" data-dcr-governing-value="${Number.isFinite(g?.governingDcr)?g.governingDcr:''}">${shearDcrNumber(g?.governingDcr)}</div><div class="result-footnote">${esc(g?.sourceLabel||'Gaya atau kapasitas belum tersedia')}</div><p class="shear-dcr-status ${shearDcrTone(g?.status)}">${shearDcrStatus(g?.status)}</p>${g?.governingCheck?`<small>${esc(labels[g.governingCheck]||g.governingCheck)}</small>`:''}</div><div class="metric-list"><p class="input-note"><b>${r===s?'Sumber terpilih':'Sumber rasio terbesar'}</b><br>${esc(source)}</p>${Object.entries(labels).map(([key,label])=>`<div class="metric"><span>${label}</span><b data-dcr-summary-check="${key}" data-value="${Number.isFinite(r?.checks?.[key]?.dcr)?r.checks[key].dcr:''}">${shearDcrNumber(r?.checks?.[key]?.dcr)}</b></div>`).join('')}</div><p class="input-note">DCR ≤ 1: dalam batas model; DCR &gt; 1: melebihi batas model. Nilai — menunggu input yang diperlukan.</p><p class="input-note">${esc(shearDcrLimits(d.mode))}</p><button type="button" class="secondary-button full-width" data-tab="shear">Input geser & torsi</button></div>`;
+ return `<div class="shear-dcr-summary" data-dcr-summary data-dcr-status="${shearDcrTone(g?.status)}">${shearProposalNote(description)}<div class="result-card hero-result"><div class="eyebrow">DCR TERBESAR TERHITUNG · MODEL</div><div class="hero-number" data-dcr-governing-value="${Number.isFinite(g?.governingDcr)?g.governingDcr:''}">${shearDcrNumber(g?.governingDcr)}</div><div class="result-footnote">${esc(g?.sourceLabel||'Gaya atau kapasitas belum tersedia')}</div><p class="shear-dcr-status ${shearDcrTone(g?.status)}">${shearDcrStatus(g?.status)}</p>${g?.governingCheck?`<small>${esc(labels[g.governingCheck]||g.governingCheck)}</small>`:''}</div><div class="metric-list"><p class="input-note"><b>${r===s?'Sumber terpilih':'Sumber rasio terbesar'}</b><br>${esc(source)}</p>${Object.entries(labels).map(([key,label])=>`<div class="metric"><span>${label}</span><b data-dcr-summary-check="${key}" data-value="${Number.isFinite(r?.checks?.[key]?.dcr)?r.checks[key].dcr:''}">${shearDcrNumber(r?.checks?.[key]?.dcr)}</b></div>`).join('')}</div><p class="input-note">DCR ≤ 1: dalam batas model; DCR &gt; 1: melebihi batas model. Nilai — menunggu input yang diperlukan.</p><p class="input-note">${esc(shearDcrLimits(d.mode))}</p><button type="button" class="secondary-button full-width" data-tab="shear">Input geser & torsi</button></div>`;
 }
 function shearDcrDetailMarkup(row,mode){
  const labels=shearDcrCheckLabels(mode);
@@ -21458,7 +21609,7 @@ function shearDcrResultsMarkup(description){
  const sourceRows=d.rows||[],selectedExtra=description.loads?.mode==='manual'&&s?.id&&!sourceRows.some(row=>row.id===s.id)?[s]:[];
  const rows=[...sourceRows,...selectedExtra];
  const cell=(row,key)=>{const c=row.checks?.[key]||{},title=[c.formula,...(c.missing||[]),...(c.errors||[])].filter(Boolean).join(' · ');return `<td data-dcr-check="${key}" data-value="${Number.isFinite(c.dcr)?c.dcr:''}" class="shear-dcr-status ${shearDcrTone(c.status)}" title="${esc(title)}">${shearDcrNumber(c.dcr)}</td>`;};
- let html=`<section class="shear-dcr-body"><div class="result-table-intro"><h2>DCR geser & torsi</h2><p>${d.mode==='total'?'Geser total dari parameter beton, lebar efektif dan prategang input.':'Geser dari kontribusi tulangan yang dihitung pada model aktif.'} DCR = demand / capacity; batas numerik 1,00.</p><p>${esc(shearDcrLimits(d.mode))}</p><p><b>Kombinasi terpilih:</b> <span data-dcr-selected-source>${esc(s?.sourceLabel||'Belum dipilih')}</span><br><b>Rasio terbesar terhitung:</b> <span data-dcr-governing-source>${g?esc(g.sourceLabel)+' · '+shearDcrNumber(g.governingDcr):'Belum tersedia'}</span></p></div>`;
+ let html=`<section class="shear-dcr-body"><div class="result-table-intro"><h2>DCR geser & torsi</h2>${shearProposalNote(description)}<p>${d.mode==='total'?'Geser total dari parameter beton, lebar efektif dan prategang input.':'Geser dari kontribusi tulangan yang dihitung pada model aktif.'} DCR = demand / capacity; batas numerik 1,00.</p><p>${esc(shearDcrLimits(d.mode))}</p><p><b>Kombinasi terpilih:</b> <span data-dcr-selected-source>${esc(s?.sourceLabel||'Belum dipilih')}</span><br><b>Rasio terbesar terhitung:</b> <span data-dcr-governing-source>${g?esc(g.sourceLabel)+' · '+shearDcrNumber(g.governingDcr):'Belum tersedia'}</span></p></div>`;
  html+=`<div class="shear-dcr-scroll"><table id="shear-dcr-results"><thead><tr><th>Baris</th><th>Elem</th><th>Load</th><th>Part</th><th>Vy (kN)</th><th>Vz (kN)</th><th>T (kN·m)</th>${Object.values(labels).map(label=>`<th>${label}</th>`).join('')}<th>DCR maks.</th><th>Status model</th><th>Sumber</th></tr></thead><tbody>${rows.length?rows.map(row=>`<tr data-dcr-row="${esc(row.id||'manual')}" data-dcr-row-status="${shearDcrTone(row.status)}" data-dcr-selected="${!!(s?.id&&row.id===s.id)}" data-dcr-governing="${!!(g?.id&&row.id===g.id)}"><td>${Number.isInteger(row.index)?row.index+1:'—'}</td><td>${esc(row.elem||'—')}</td><td>${esc(row.load||'—')}</td><td>${esc(row.part||'—')}</td>${['VuY','VuZ','Tu'].map(key=>`<td>${shearDcrNumber(row.demands?.[key],2)}</td>`).join('')}${Object.keys(labels).map(key=>cell(row,key)).join('')}<td data-dcr-row-max="${Number.isFinite(row.governingDcr)?row.governingDcr:''}">${shearDcrNumber(row.governingDcr)}</td><td class="shear-dcr-status ${shearDcrTone(row.status)}">${shearDcrStatus(row.status)}</td><td>${row.id&&Number.isInteger(row.index)?`<button type="button" class="text-button" data-shear-pick-load="${esc(row.id)}">Gunakan</button>`:'Manual'}</td></tr>`).join(''):'<tr><td colspan="16">Belum ada kombinasi. Isi tabel Gaya dalam atau gunakan sumber gaya manual pada Geser & torsi.</td></tr>'}</tbody></table></div>`;
  html+='<p class="input-note result-table-note">Setiap baris memakai Vy, Vz dan T dari kombinasi yang sama. Rasio terbesar memilih satu baris sumber; maksimum antar komponen tidak dijadikan kombinasi baru. Status belum lengkap tetap ditampilkan jika sebagian pemeriksaan belum dapat dihitung.</p>';
  html+=`<div class="result-table-intro"><h3>Rincian kombinasi terpilih</h3><p>${esc(s?.sourceLabel||'Belum dipilih')}</p></div>${shearDcrDetailMarkup(s,d.mode)}`;
@@ -21529,19 +21680,29 @@ function shearTorsionContributionMarkup(description){
 }
 function shearAutomaticInput(description,key,label,unit,min,max){
  const p=description.settings,value=description.resolved[key],source=description.parameterSources[key],auto=p[key+'Mode']==='auto';
+ const proposed=['bvY','bvZ','betaY','betaZ','lambda','kductY','kductZ','VpY','VpZ'].includes(key);
  const basis=auto&&source.cases?.length?`<details class="input-note"><summary>Rincian hasil penampang</summary>${source.cases.map(c=>`<p>${esc(c.name||c.id)}: h = ${fmt(c.h,2)} mm; de = ${fmt(c.de,2)} mm; z = ${fmt(c.z,2)} mm; dv = ${fmt(c.value,2)} mm.</p>`).join('')}</details>`:'';
- return `<div class="field shear-automatic-field" data-shear-automatic="${key}"><span class="field-label">${label}</span><select aria-label="Sumber ${key}" data-shear-key="${key}Mode"><option value="auto"${auto?' selected':''}>Otomatis${source.assumed?' · nilai awal metode':''}</option><option value="manual"${p[key+'Mode']==='manual'?' selected':''}>Input manual</option></select><span class="input-group"><input aria-label="${esc(label)}" type="number" step="any" data-shear-key="${key}" value="${Number.isFinite(value)?value:''}" placeholder="${auto?'Menunggu analisis penampang valid':'Belum diisi'}" min="${min}"${max===undefined?'':` max="${max}"`}${auto?' readonly':''}><span class="field-unit">${unit}</span></span><span class="input-note" data-shear-parameter-source="${key}" data-assumed="${!!source.assumed}">${esc(source.source)}${auto&&source.formula?'<br>'+esc(source.formula):''}${auto&&(source.reason||source.note)?'<br>'+esc(source.reason||source.note):''}</span>${basis}</div>`;
+ return `<div class="field shear-automatic-field" data-shear-automatic="${key}"><span class="field-label">${label}</span><select aria-label="Sumber ${key}" data-shear-key="${key}Mode"><option value="auto"${auto?' selected':''}>${proposed?'Usulan awal dari model':'Otomatis'+(source.assumed?' · nilai awal metode':'')}</option><option value="manual"${p[key+'Mode']==='manual'?' selected':''}>Input manual</option></select><span class="input-group"><input aria-label="${esc(label)}" type="number" step="any" data-shear-key="${key}" value="${Number.isFinite(value)?value:''}" placeholder="${auto?'Menunggu data model valid':'Belum diisi'}"${min===undefined?'':` min="${min}"`}${max===undefined?'':` max="${max}"`}${auto?' readonly':''}><span class="field-unit">${unit}</span></span><span class="input-note" data-shear-parameter-source="${key}" data-assumed="${auto&&!!source.assumed}">${esc(source.source)}${auto&&source.formula?'<br>'+esc(source.formula):''}${auto&&(source.reason||source.note)?'<br>'+esc([source.reason,source.note].filter(Boolean).join(' ')):''}</span>${basis}</div>`;
+}
+function shearModelSuggestionsMarkup(description){
+ const s=description.automatic.suggestions,i=s.inventory;
+ const metric=(key,label,value,unit,digits=2)=>shearMetric('suggested-'+key,label,value,unit,digits);
+ return `<div id="shear-model-suggestions" class="notice"><b>Usulan dari penampang & tendon aktif</b><p class="input-note">${fmt(i.tendonCount,0)} tendon pada model. Lebar di bawah berasal dari irisan beton minimum sepanjang rentang rongga, sebelum pengurangan duct. Y mengikuti arah vertikal editor; Z mengikuti arah horizontal.</p>`+
+ metric('bvY','Lebar bruto arah Y',s.widths.Y.value,'mm')+metric('bvZ','Lebar bruto arah Z',s.widths.Z.value,'mm')+
+ i.cases.map(c=>`<div class="input-note" data-shear-tendon-case="${esc(c.id)}"><b>${esc(c.name||c.id)}</b>`+metric(c.id+'-strands','Jumlah strand',c.strands,'strand',0)+metric(c.id+'-area','Aps total',c.area,'mm²')+metric(c.id+'-Pe','Pe · prategang aksial efektif',c.Pe,'kN')+'</div>').join('')+
+ `<p class="input-note">Pe = Σ strand × luas satu strand × fpu × UTS × (1 − losses) / 1.000. Pe bukan Vp. Koordinat penampang tidak menentukan kemiringan profil tendon.</p><p class="input-note">Usulan awal: β = 2 hanya untuk θ = 45°, λ = 1 untuk beton berat normal, kduct = 1 tanpa reduksi duct, dan Vp = 0 untuk asumsi tendon lurus. Pilih <b>Input manual</b> bila kondisi proyek berbeda. Nilai usulan mengikuti perubahan model; input manual tetap dipakai.</p>`+
+ i.errors.map(e=>`<p class="form-error">${esc(e)}</p>`).join('')+'</div>';
 }
 function shearDcrSettingsMarkup(description){
  const p=description.settings,total=p.dcrMode==='total';
- const input=(key,label,unit,min,max)=>`<label class="field"><span class="field-label">${label}</span><span class="input-group"><input type="number" step="any" data-shear-key="${key}" value="${Number.isFinite(p[key])?p[key]:''}" placeholder="Belum diisi"${min===undefined?'':` min="${min}"`}${max===undefined?'':` max="${max}"`}><span class="field-unit">${unit}</span></span></label>`;
+ const input=(key,label,unit,min,max)=>shearAutomaticInput(description,key,label,unit,min,max);
  let html=`<label class="field"><span class="field-label">Dasar DCR geser</span><select data-shear-key="dcrMode"><option value="steel"${!total?' selected':''}>Kontribusi baja · φVs</option><option value="total"${total?' selected':''}>Geser total · beton, baja & Vp</option></select></label>`;
- if(total)html+=`<p class="input-note">AASHTO LRFD 5.7.3.3: Vn = min(Vc + kduct Vs; 0,25 f′c bv dv / 1000) + Vp,arah; Vr = φv Vn; DCRv = |Vu| / Vr. Vc = 0,083 λ β √f′c bv dv / 1000. Vp,arah = sign(Vu) × Vp. Input panjang mm, tegangan MPa, gaya kN.</p>`+
+ if(total)html+=shearModelSuggestionsMarkup(description)+`<p class="input-note">AASHTO LRFD 5.7.3.3: Vn = min(Vc + kduct Vs; 0,25 f′c bv dv / 1000) + Vp,arah; Vr = φv Vn; DCRv = |Vu| / Vr. Vc = 0,083 λ β √f′c bv dv / 1000. Vp,arah = sign(Vu) × Vp. Input panjang mm, tegangan MPa, gaya kN.</p>`+
  input('bvY','bv,y · lebar web efektif arah Y','mm',0)+input('bvZ','bv,z · lebar web efektif arah Z','mm',0)+
  input('betaY','βy · faktor transfer tarik beton arah Y','',0)+input('betaZ','βz · faktor transfer tarik beton arah Z','',0)+input('lambda','λ · faktor jenis beton','',0,1)+
  input('kductY','kduct,y · faktor koreksi Vs akibat duct','',0,1)+input('kductZ','kduct,z · faktor koreksi Vs akibat duct','',0,1)+
  input('VpY','Vp,y · komponen prategang bertanda searah Vy','kN')+input('VpZ','Vp,z · komponen prategang bertanda searah Vz','kN')+
- '<p class="input-note">Gunakan bv efektif setelah mempertimbangkan duct, serta β dan θ yang konsisten dengan metode proyek. kduct = 1 berarti tanpa reduksi duct; Vp = 0 berarti komponen tersebut memang nol. Nilai kosong tidak dianggap 1 atau 0. Vp bertanda memakai sumbu yang sama dengan gaya dalam. Vp searah Vu menambah kapasitas; Vp berlawanan arah menguranginya. Untuk Vu = 0, arah positif dipakai sebagai acuan. Kapasitas total yang nol atau negatif tidak menghasilkan DCR.</p>';
+ '<p class="input-note">Usulan bv belum dikurangi duct; masukkan lebar efektif manual setelah koreksi proyek. β dan θ harus konsisten dengan metode proyek. Nilai kosong tidak dianggap 1 atau 0. Vp usulan nol mengasumsikan tendon lurus; Vp manual bertanda memakai sumbu yang sama dengan gaya dalam. Vp searah Vu menambah kapasitas; Vp berlawanan arah menguranginya. Untuk Vu = 0, arah positif dipakai sebagai acuan. Kapasitas total yang nol atau negatif tidak menghasilkan DCR.</p>';
  else html+='<p class="input-note">DCRv,baja = |Vu| / φVs. Kontribusi beton dan komponen prategang tidak masuk pada rasio baja ini.</p>';
  return html+'<p class="input-note">DCR V–T membandingkan kebutuhan sengkang bersama per arah. Mode total: Vs,req = max(|Vu|/φv − Vc − Vp,arah; 0); rasio = Vs,req/(kduct Vs) + |Tu|/(φt Tn,s). Batas baja longitudinal torsi ditampilkan terpisah. Interaksi tekan beton tiap dinding box memerlukan pemeriksaan tambahan.</p><button type="button" class="secondary-button full-width" data-table="shear-results">Lihat DCR di Hasil Analisis →</button>';
 }
@@ -21627,6 +21788,9 @@ function calculateShearTorsion(){
 function shearResultRows(){
  const d=ShearProject.describe(model,result),p=d.resolved,g=d.geometry,r=d.reinforcement,l=d.loads;
  return [['GEOMETRI DAN TULANGAN GESER–TORSI',model.name],['Parameter','Nilai','Satuan'],
+  ['Tendon pada model aktif',d.automatic.suggestions.inventory.tendonCount,'tendon'],
+  ...d.automatic.suggestions.inventory.cases.flatMap(c=>[['Inventaris tendon · '+(c.name||c.id),'',''],['Jumlah strand',c.strands,'strand'],['Aps total',c.area,'mm²'],['Pe aksial efektif · bukan Vp',c.Pe,'kN']]),
+  ['Dasar usulan geser total','Lebar bruto sebelum koreksi duct; β=2 hanya dengan θ=45°; λ=1 beton normal; kduct=1 tanpa reduksi; Vp=0 asumsi tendon lurus. Input manual menggantikan usulan.',''],
   ['Selimut bersih',p.coverClear,'mm'],['Diameter sengkang',p.diameter,'mm'],['Spasi sengkang',p.spacing,'mm'],['Kaki efektif Y',p.legsY,'kaki'],['Kaki efektif Z',p.legsZ,'kaki'],['fyv',p.fyv,'MPa'],['Theta',p.theta,'derajat'],['dv Y',p.dvY,'mm'],['dv Z',p.dvZ,'mm'],['Faktor reduksi geser',p.phiShear,''],['Faktor reduksi torsi',p.phiTorsion,''],['Ao/Aoh',p.aoFactor,''],['Al efektif torsi',p.Al,'mm²'],['fyl',p.fyl,'MPa'],['Al terdistribusi dan dijangkar',p.longitudinalDistributed?'Ya':'Belum dinyatakan',''],['Sengkang tertutup',p.closedHoop?'Ya':'Tidak',''],
   ['Acp',g.Acp,'mm²'],['Pcp',g.Pcp,'mm'],['Ac bersih',g.netConcreteArea,'mm²'],['Aoh',g.ok?g.Aoh:null,'mm²'],['Poh',g.ok?g.Poh:null,'mm'],['Garis tengah valid',g.ok?'Ya':'Belum valid',''],
   ...ShearProject.automaticKeys.flatMap(key=>[[`Mode ${key}`,d.settings[key+'Mode'],''],[`Sumber ${key}`,d.parameterSources[key].source,''],[`Rumus ${key}`,d.parameterSources[key].formula||'Input manual',''],[`Catatan ${key}`,d.parameterSources[key].reason||d.parameterSources[key].note||'',''],...(d.parameterSources[key].cases||[]).flatMap(c=>[['Kasus '+key,c.name||c.id,''],...['h','de','z','value'].map(k=>[key+' '+k,c[k],'mm'])])]),
